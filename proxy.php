@@ -200,7 +200,7 @@ if ($method === 'GET' && !$nrvpDaemonOk) {
     // let genuinely active transfers keep going much longer (protects
     // download throughput/stability) — governed by two separate clocks.
     $idleTimeoutSec = 2.5;      // no NEW data this long -> release the worker
-    $absoluteMaxSec = 25;     // hard backstop regardless of activity
+    $absoluteMaxSec = 5;     // hard backstop regardless of activity
     $daemonCallTimeoutSec = 3; // must be > daemon's NRVD_PENDING_GET_MAX_WAIT_SEC (4s)
     $deadline = microtime(true) + $absoluteMaxSec;
     $lastActivity = microtime(true);
