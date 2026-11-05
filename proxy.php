@@ -95,12 +95,20 @@ if ($sessionId === null || $sessionId === '') {
 }
 
 define('NRVP_DEBUG_LOG', __DIR__ . '/bin/proxy-debug.log');
+// ── Debug logging toggle ─────────────────────────────────────
+// Set to false to disable ALL writes to proxy-debug.log. On a busy
+// shared host, the FILE_APPEND|LOCK_EX write on every single proxied
+// request (per GET poll, per POST forward) becomes a real bottleneck.
+// Flip back to true only while actively diagnosing an issue.
+define('NRVP_DEBUG_ENABLED', false);
+// ─────────────────────────────────────────────────────────────
 $nrvpDebugStart = microtime(true);
 $GLOBALS['nrvp_method'] = $_SERVER['REQUEST_METHOD'] ?? '?';
 $GLOBALS['nrvp_forwardPath'] = $_SERVER['REQUEST_URI'] ?? '?';
 $GLOBALS['nrvp_logged'] = false;
 
 function nrvp_write_log($daemonNote, $status, $bytesOut, $extra = '') {
+    if (!NRVP_DEBUG_ENABLED) return; // logging disabled — zero I/O on this path
     if ($GLOBALS['nrvp_logged']) return; // avoid double-logging on normal completion
     $GLOBALS['nrvp_logged'] = true;
     $duration = round((microtime(true) - $GLOBALS['nrvp_debug_start']) * 1000);
@@ -118,7 +126,10 @@ $GLOBALS['nrvp_debug_start'] = $nrvpDebugStart;
 
 // GUARANTEED logging even on a fatal error / uncaught exception, so a
 // silently-dying request is never invisible to us again.
+// (Automatically silent when NRVP_DEBUG_ENABLED is false — it delegates
+// to nrvp_write_log, which short-circuits before touching disk.)
 register_shutdown_function(function () {
+    if (!NRVP_DEBUG_ENABLED) return;
     if ($GLOBALS['nrvp_logged']) return;
     $err = error_get_last();
     $note = $err ? ('FATAL: ' . str_replace(["\r", "\n"], ' ', $err['message']) . ' @ ' . $err['file'] . ':' . $err['line']) : 'shutdown-without-explicit-log';
@@ -326,8 +337,8 @@ if ($method === 'GET' && !$nrvpDaemonOk) {
     }
 }
 
-// ---- debug log 
-// ----
+// ---- debug log ----
+// (No-op unless NRVP_DEBUG_ENABLED is true — see top of file.)
 nrvp_write_log(
     $nrvpDaemonOk ? 'ok' : ('FAIL(' . ($ensureResp === null ? 'unreachable' : trim($ensureResp)) . ')'),
     $nrvpStatusCode ?? 'none',
