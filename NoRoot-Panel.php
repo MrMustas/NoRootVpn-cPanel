@@ -564,52 +564,138 @@ function nrv_daemon_stop($cfg) {
     nrv_process_stop($cfg['paths']['base_dir'] . '/daemon.pid', nrv_find_php_binary());
 }
 
+// Flags that must be passed to the resolved PHP binary when spawning it —
+// populated by nrv_find_php_binary() below. Empty array = no extra flags.
+function nrv_php_cli_flags($set = null) {
+    static $flags = [];
+    if ($set !== null) $flags = $set;
+    return $flags;
+}
+
+// Resolve a *working* CLI PHP binary. On cPanel/CloudLinux + LiteSpeed hosts:
+//   - PHP_BINARY is /usr/local/bin/lsphp (LiteSpeed's SAPI binary), which
+//     accepts -r but loads a system ini that may be broken
+//     (e.g. /opt/alt/php74/etc/php.ini with a syntax error on line 2) and
+//     dies before doing anything useful.
+//   - The real CLI is at /opt/alt/php<NN>/usr/bin/php (CloudLinux alt-php)
+//     or /opt/cpanel/ea-php<NN>/root/usr/bin/php (cPanel EA4), but those use
+//     the same broken system ini by default.
+// So: build a candidate list, skip SAPI-only binaries (fpm/cgi/lsphp), and
+// for each candidate actually TEST it with `-r 'echo "ok";'` — first with
+// no flags, then with `-n -d date.timezone=UTC` which bypasses a broken ini.
 function nrv_find_php_binary() {
+    static $resolved = null;
+    if ($resolved !== null) return $resolved;
+
     if (NRV_IS_WINDOWS) {
         if (defined('PHP_BINARY') && PHP_BINARY && stripos(PHP_BINARY, 'php') !== false && is_executable(PHP_BINARY)) {
-            return PHP_BINARY;
+            $resolved = PHP_BINARY;
+            return $resolved;
         }
         $iniFile = @php_ini_loaded_file();
         if ($iniFile) {
             $iniDir = dirname($iniFile);
             foreach ([$iniDir . '\\php.exe', $iniDir . '\\php-cgi.exe'] as $c) {
-                if (is_executable($c)) return $c;
+                if (is_executable($c)) { $resolved = $c; return $resolved; }
             }
         }
         foreach ((array)@glob('C:\\laragon\\bin\\php\\php-*\\php.exe') as $c) {
-            if (is_executable($c)) return $c;
+            if (is_executable($c)) { $resolved = $c; return $resolved; }
         }
         foreach (['C:\\xampp\\php\\php.exe', 'C:\\wamp64\\bin\\php\\php.exe'] as $c) {
-            if (is_executable($c)) return $c;
+            if (is_executable($c)) { $resolved = $c; return $resolved; }
         }
         if (nrv_exec_available()) {
             $out = [];
             @exec('where php.exe 2>NUL', $out);
-            if (!empty($out[0])) return trim($out[0]);
+            if (!empty($out[0])) { $resolved = trim($out[0]); return $resolved; }
         }
-        return 'php.exe'; // last resort
+        $resolved = 'php.exe'; // last resort
+        return $resolved;
     }
-    // The web SAPI's own interpreter path is the most reliable choice —
-    // 'php' alone can be missing or wrong-versioned in exec()'s minimal PATH.
+
+    $candidates = [];
+
+    // 1. PHP_BINARY itself, unless it's a SAPI-only binary (FPM/CGI/lsphp).
     if (defined('PHP_BINARY') && PHP_BINARY && is_executable(PHP_BINARY)) {
-        return PHP_BINARY;
+        $base = strtolower(basename(PHP_BINARY));
+        $isSapiOnly = (strpos($base, 'fpm') !== false)
+            || (strpos($base, 'cgi') !== false)
+            || (strpos($base, 'lsphp') !== false)
+            || (strpos($base, 'lsws') !== false);
+        if (!$isSapiOnly) {
+            $candidates[] = PHP_BINARY;
+        }
+        $sibling = dirname(PHP_BINARY) . DIRECTORY_SEPARATOR . 'php';
+        if (is_executable($sibling) && !in_array($sibling, $candidates, true)) {
+            $candidates[] = $sibling;
+        }
     }
-    $candidates = ['/usr/bin/php', '/usr/local/bin/php', '/opt/cpanel/ea-php81/root/usr/bin/php', '/opt/cpanel/ea-php82/root/usr/bin/php'];
-    foreach ($candidates as $c) {
-        if (is_executable($c)) return $c;
+
+    // 2. Known-version globs across cPanel EA4, CloudLinux alt-php, Plesk.
+    $globs = [
+        '/opt/cpanel/ea-php*/root/usr/bin/php',
+        '/opt/alt/php*/usr/bin/php',
+        '/opt/plesk/php/*/bin/php',
+    ];
+    foreach ($globs as $pattern) {
+        $matches = @glob($pattern);
+        if (is_array($matches) && $matches) {
+            sort($matches, SORT_NATURAL | SORT_FLAG_CASE);
+            foreach (array_reverse($matches) as $c) {
+                if (!in_array($c, $candidates, true)) $candidates[] = $c;
+            }
+        }
     }
+
+    // 3. Plain absolute paths.
+    foreach (['/usr/bin/php', '/usr/local/bin/php', '/usr/local/php/bin/php', '/opt/php/bin/php'] as $c) {
+        if (!in_array($c, $candidates, true)) $candidates[] = $c;
+    }
+
+    // 4. Whatever `command -v php` says.
     $out = [];
     @exec('command -v php 2>/dev/null', $out);
-    if (!empty($out[0])) return trim($out[0]);
-    return 'php'; // last resort
+    if (!empty($out[0])) {
+        $c = trim($out[0]);
+        if (!in_array($c, $candidates, true)) $candidates[] = $c;
+    }
+
+    // 5. Absolute last resort: PHP_BINARY even if we flagged it as SAPI-only.
+    if (defined('PHP_BINARY') && PHP_BINARY && !in_array(PHP_BINARY, $candidates, true)) {
+        $candidates[] = PHP_BINARY;
+    }
+
+    // Probe each candidate: first bare, then with -n (skip broken ini).
+    $probeCode = 'echo "ok";';
+    $nFlagSet = ['-n', '-d', 'date.timezone=UTC'];
+    foreach ($candidates as $c) {
+        if (!is_executable($c)) continue;
+
+        $out1 = [];
+        @exec(escapeshellarg($c) . ' -r ' . escapeshellarg($probeCode) . ' 2>/dev/null', $out1);
+        if (!empty($out1) && trim(implode("\n", $out1)) === 'ok') {
+            $resolved = $c;
+            nrv_php_cli_flags([]);
+            return $resolved;
+        }
+
+        $out2 = [];
+        $prefix2 = implode(' ', array_map('escapeshellarg', $nFlagSet));
+        @exec(escapeshellarg($c) . ' ' . $prefix2 . ' -r ' . escapeshellarg($probeCode) . ' 2>/dev/null', $out2);
+        if (!empty($out2) && trim(implode("\n", $out2)) === 'ok') {
+            $resolved = $c;
+            nrv_php_cli_flags($nFlagSet);
+            return $resolved;
+        }
+    }
+
+    $resolved = (defined('PHP_BINARY') && PHP_BINARY) ? PHP_BINARY : 'php';
+    nrv_php_cli_flags([]);
+    return $resolved;
 }
 
 function nrv_daemon_start($cfg) {
-    // daemon.php only claims its own pidfile after a successful bind (fixed
-    // in daemon.php itself), so nrv_daemon_pid() here is trustworthy — no
-    // port-based shortcut needed or wanted (one previously caused false
-    // "Running" reports on a real host where something else answered on
-    // this port while the daemon had never actually started).
     if (nrv_daemon_pid($cfg) !== null) return ['ok' => true];
     if (!nrv_process_control_available()) return ['ok' => false, 'error' => 'Neither exec() nor proc_open() is available'];
     $daemonScript = NRV_DIR . '/daemon.php';
@@ -620,10 +706,12 @@ function nrv_daemon_start($cfg) {
 
     @unlink($fatalLog);
     $phpBin = nrv_find_php_binary();
+    $phpFlags = nrv_php_cli_flags();
+    $cmd = array_merge([$phpBin], $phpFlags, [$daemonScript]);
 
-    $pid = nrv_spawn_background([$phpBin, $daemonScript], $log);
+    $pid = nrv_spawn_background($cmd, $log);
     if ($pid === false) {
-        return ['ok' => false, 'error' => 'Failed to spawn daemon process (php binary used: ' . $phpBin . '). ' . nrv_spawn_last_error()];
+        return ['ok' => false, 'error' => 'Failed to spawn daemon process (php binary used: ' . $phpBin . ' ' . implode(' ', $phpFlags) . '). ' . nrv_spawn_last_error()];
     }
 
     usleep(700000);
@@ -632,8 +720,7 @@ function nrv_daemon_start($cfg) {
         return ['ok' => true];
     }
 
-    // Failed — surface the most useful diagnostic we can find.
-    $error = 'Daemon did not stay running (php binary used: ' . $phpBin . ').';
+    $error = 'Daemon did not stay running (php binary used: ' . $phpBin . ' ' . implode(' ', $phpFlags) . ').';
     if (file_exists($fatalLog)) {
         $error .= ' ' . trim(file_get_contents($fatalLog));
     } elseif (file_exists($log)) {
@@ -651,11 +738,16 @@ function nrv_daemon_restart($cfg) {
     return nrv_daemon_start($cfg);
 }
 
-// Build the server-side Xray config.json from the users list
+// Build the server-side Xray config.json from the users list.
+// sessionPlacement = "path": the xhttp client (v2rayNG/v2rayN) places the
+// session UUID as the first path segment after the proxy path —
+// /proxy.php/<uuid>?x_seq=0 — not in the query string. proxy.php reads it
+// from that segment. seqPlacement stays "query" because x_seq really does
+// arrive in the query string.
 function nrv_build_xray_config($cfg) {
     $clients = [];
     foreach ($cfg['users'] as $u) {
-        if (array_key_exists('enabled', $u) && !$u['enabled']) continue; // disabled users keep their record but lose server-side access
+        if (array_key_exists('enabled', $u) && !$u['enabled']) continue;
         $clients[] = ['id' => $u['id'], 'level' => 0];
     }
     $conf = [
@@ -672,18 +764,9 @@ function nrv_build_xray_config($cfg) {
                 'network' => 'xhttp',
                 'xhttpSettings' => [
                     'path' => $cfg['xray']['proxy_public_path'] ?? '/proxy.php',
-                    // "auto" (not a hardcoded single sub-mode) so the server
-                    // doesn't reject a client's session-less/initial request
-                    // with "stream-one mode is not allowed" — confirmed from
-                    // Xray-core's own source (transport/internet/splithttp/hub.go):
-                    // that specific check only passes when Mode is "", "auto",
-                    // "stream-one", or "stream-up". Our own relay (daemon.php's
-                    // hand-crafted download connection) always includes a real
-                    // x_session, so this doesn't change how it behaves — it only
-                    // stops rejecting requests from real clients that don't.
                     'mode' => 'auto',
                     'extra' => [
-                        'sessionPlacement' => 'query',
+                        'sessionPlacement' => 'path',
                         'seqPlacement' => 'query',
                     ],
                     'xmux' => [
@@ -733,7 +816,7 @@ function nrv_client_links($cfg, $user) {
         $queryParams['fp'] = 'chrome';
         $queryParams['alpn'] = 'h2';
     }
-    $queryParams['extra'] = json_encode(['sessionPlacement' => 'query', 'seqPlacement' => 'query'], JSON_UNESCAPED_SLASHES);
+    $queryParams['extra'] = json_encode(['sessionPlacement' => 'path', 'seqPlacement' => 'query'], JSON_UNESCAPED_SLASHES);
     $queryParams['xmux'] = json_encode($xmux, JSON_UNESCAPED_SLASHES);
     $query = http_build_query($queryParams);
     $vlessUri = "vless://{$user['id']}@{$host}:{$port}?{$query}#{$name}";
@@ -746,7 +829,7 @@ function nrv_client_links($cfg, $user) {
             'path' => $path,
             'mode' => 'packet-up',
             'extra' => [
-                'sessionPlacement' => 'query',
+                'sessionPlacement' => 'path',
                 'seqPlacement' => 'query',
             ],
             'xmux' => $xmux,
@@ -813,15 +896,13 @@ function nrv_run_env_tests() {
     $tests[] = ['name' => 'Write permission in panel directory', 'ok' => $writeOk, 'detail' => $writeOk ? NRV_DIR : 'Not writable — installation cannot proceed'];
 
     if ($execOk || $procOpenOk) {
-        // Some real hosts (loaded shared hosting, lsphp-wrapped PHP) are slow
-        // enough that a tight timing budget here produces a false negative
-        // even though detachment genuinely works — poll for up to ~4s instead
-        // of a single fixed sleep, and only report failure if it never shows up.
         $bgFile = sys_get_temp_dir() . '/nrv_bgtest_' . uniqid() . '.txt';
         $phpBin = nrv_find_php_binary();
+        $phpFlags = nrv_php_cli_flags();
         $probeLog = sys_get_temp_dir() . '/nrv_bgtest_' . uniqid() . '.log';
         $code = 'usleep(800000); file_put_contents(' . var_export($bgFile, true) . ', "ok");';
-        $pid = nrv_spawn_background([$phpBin, '-r', $code], $probeLog);
+        $cmd = array_merge([$phpBin], $phpFlags, ['-r', $code]);
+        $pid = nrv_spawn_background($cmd, $probeLog);
         $alive = false;
         $deadline = microtime(true) + 4.0;
         while (microtime(true) < $deadline) {
@@ -830,7 +911,9 @@ function nrv_run_env_tests() {
         }
         @unlink($bgFile);
         @unlink($probeLog);
-        $tests[] = ['name' => 'Background process (detached PHP spawn)', 'ok' => $alive, 'detail' => $alive ? "PID $pid completed its detached task" : 'Process did not complete after detaching from the request — Xray/daemon Start may need to be retried or done manually if this keeps failing'];
+        $detailOk = "PID $pid completed its detached task";
+        $detailFail = 'Process did not complete after detaching (php used: ' . $phpBin . ' ' . implode(' ', $phpFlags) . ') — Xray/daemon Start may need to be retried or done manually if this keeps failing';
+        $tests[] = ['name' => 'Background process (detached PHP spawn)', 'ok' => $alive, 'detail' => $alive ? $detailOk : $detailFail];
     }
 
     return $tests;
@@ -849,12 +932,6 @@ define('NRV_XRAY_ZIP_MAX_BYTES', 80 * 1024 * 1024);
 define('NRV_XRAY_ZIP_ENTRY_MAX_BYTES', 200 * 1024 * 1024);
 define('NRV_XRAY_ZIP_MAX_ENTRIES', 20);
 
-// Best-effort integrity check: GitHub's Releases API reports a sha256 digest
-// for each uploaded asset (independent of the CDN download path itself).
-// Returns the hex digest string, or null if it couldn't be determined for
-// any reason (API unreachable, field absent, etc.) — callers must treat null
-// as "skip this check", not as a failure, so a GitHub API hiccup can never
-// block an otherwise-working install.
 function nrv_fetch_github_asset_digest($assetName) {
     if (!function_exists('curl_init')) return null;
     $ch = curl_init('https://api.github.com/repos/XTLS/Xray-core/releases/latest');
@@ -871,7 +948,6 @@ function nrv_fetch_github_asset_digest($assetName) {
     if (!is_array($data) || empty($data['assets'])) return null;
     foreach ($data['assets'] as $asset) {
         if (($asset['name'] ?? '') === $assetName && !empty($asset['digest'])) {
-            // Format is "sha256:<hex>"
             $parts = explode(':', $asset['digest'], 2);
             if (count($parts) === 2 && $parts[0] === 'sha256') return strtolower($parts[1]);
         }
@@ -880,10 +956,6 @@ function nrv_fetch_github_asset_digest($assetName) {
 }
 
 function nrv_download_xray($destDir) {
-    // A slow connection to GitHub can legitimately take well over PHP's
-    // default max_execution_time (often 30-60s on shared hosting), which
-    // would otherwise fatal-error this ENTIRE request partway through the
-    // download — give this specific slow network operation real headroom.
     @set_time_limit(120);
     $arch = nrv_detect_arch();
     if (NRV_IS_WINDOWS) {
@@ -910,8 +982,6 @@ function nrv_download_xray($destDir) {
             $downloaded = $ok && filesize($zipPath) > 100000 && filesize($zipPath) <= NRV_XRAY_ZIP_MAX_BYTES;
         }
     }
-    // Windows has no wget fallback here — the curl extension is the only supported
-    // download path on Windows; if it's missing, the admin must upload manually.
     if (!$downloaded && !NRV_IS_WINDOWS && nrv_exec_available()) {
         @exec('wget -q -O ' . escapeshellarg($zipPath) . ' ' . escapeshellarg($url) . ' 2>&1');
         $downloaded = file_exists($zipPath) && filesize($zipPath) > 100000 && filesize($zipPath) <= NRV_XRAY_ZIP_MAX_BYTES;
@@ -921,12 +991,6 @@ function nrv_download_xray($destDir) {
         return ['ok' => false, 'error' => 'Download failed. Please upload the Xray binary manually to: ' . $destDir . '/' . (NRV_IS_WINDOWS ? 'xray.exe' : 'xray')];
     }
 
-    // Integrity/authenticity check: verify the downloaded archive's sha256
-    // against the digest GitHub itself reports for this exact release asset.
-    // Best-effort by design — if the digest can't be obtained (API hiccup),
-    // we proceed rather than block an otherwise-working install; but if we
-    // DO get a digest and it doesn't match, that's a real corruption/tamper
-    // signal and the file must not be trusted.
     $expectedDigest = nrv_fetch_github_asset_digest($assetName);
     if ($expectedDigest !== null) {
         $actualDigest = @hash_file('sha256', $zipPath);
@@ -965,9 +1029,6 @@ function nrv_download_xray($destDir) {
     $binPath = rtrim($destDir, '/') . '/' . (NRV_IS_WINDOWS ? 'xray.exe' : 'xray');
     if (!file_exists($binPath)) return ['ok' => false, 'error' => 'xray binary not found after extraction'];
     if (filesize($binPath) < 1_000_000) return ['ok' => false, 'error' => 'extracted xray binary is implausibly small; download likely corrupt'];
-    // Network-independent sanity check regardless of the checksum step above:
-    // confirm the extracted file is actually the executable format expected
-    // for this OS (ELF on Linux, PE on Windows) before we ever try to run it.
     $magic = @file_get_contents($binPath, false, null, 0, 4);
     $validMagic = NRV_IS_WINDOWS ? (substr($magic, 0, 2) === 'MZ') : (substr($magic, 0, 4) === "\x7FELF");
     if (!$validMagic) {
@@ -984,10 +1045,6 @@ function nrv_download_xray($destDir) {
 define('NRV_WATCHDOG_COOLDOWN_SEC', 20);
 define('NRV_WATCHDOG_MAX_FAILS', 5);
 
-// Cheap, rate-limited liveness check + lazy relaunch. Safe to call on every
-// page load / every proxy.php request — it does nothing until the cooldown
-// has elapsed, and gives up on a service after too many consecutive failures
-// so a permanently broken host can't be hammered with relaunch attempts.
 function nrv_ensure_services_running($cfg) {
     $markerFile = $cfg['paths']['base_dir'] . '/watchdog.json';
     $marker = json_decode((string)@file_get_contents($markerFile), true);
@@ -1024,24 +1081,11 @@ function nrv_ensure_services_running($cfg) {
     }
 }
 
-// Resets the watchdog's failure counters — call this whenever an admin
-// manually starts/restarts a service, so a fresh manual attempt isn't
-// immediately blocked by a stale failure cap from earlier.
 function nrv_watchdog_reset($cfg) {
     $markerFile = $cfg['paths']['base_dir'] . '/watchdog.json';
     @file_put_contents($markerFile, json_encode(['xray_fail' => 0, 'daemon_fail' => 0, 'last' => 0]));
 }
 
-// Runs on every admin login: full env re-check, service liveness/relaunch,
-// and re-download of the Xray binary if it's gone missing. Result is meant
-// to be shown once as a dashboard banner and then discarded.
-// Probes the REAL public endpoint (not a guess from the install request's
-// own scheme) to figure out whether plain HTTP works directly or gets
-// force-redirected to HTTPS by the host — this is what previously required
-// an admin to notice a redirect-loop in a client's log and flip the TLS
-// toggle by hand. Only ever called from the login healthcheck (once per
-// login, itself cached for hours) — NEVER from proxy.php/daemon.php's
-// connection path, so it can never add per-request latency.
 function nrv_detect_public_tls($cfg) {
     if (!function_exists('curl_init')) return null;
     $host = (string)($cfg['xray']['public_host'] ?? '');
@@ -1059,12 +1103,11 @@ function nrv_detect_public_tls($cfg) {
 
     if ($resp !== false && $httpCode > 0) {
         if ($httpCode >= 300 && $httpCode < 400 && preg_match('/^Location:\s*https:/im', $resp)) {
-            return true; // plain HTTP is being redirected to HTTPS
+            return true;
         }
-        return false; // plain HTTP answered directly — no TLS needed at transport level
+        return false;
     }
 
-    // Plain HTTP didn't answer at all — see if HTTPS does (host may only speak TLS).
     $ch2 = curl_init('https://' . $host . '/');
     curl_setopt_array($ch2, [
         CURLOPT_NOBODY => true, CURLOPT_RETURNTRANSFER => true,
@@ -1076,9 +1119,6 @@ function nrv_detect_public_tls($cfg) {
     return ($resp2 !== false && $httpCode2 > 0) ? true : null;
 }
 
-// Cached (6h) wrapper — auto-corrects and persists cfg['xray']['public_tls']
-// if reality no longer matches it, returning the new value if it changed
-// (so the caller can tell the admin), or null if nothing changed/checked.
 function nrv_maybe_autocorrect_tls(&$cfg) {
     $cacheFile = NRV_DIR . '/.nrv_tls_check.json';
     $now = time();
@@ -1118,10 +1158,6 @@ function nrv_run_login_healthcheck($cfg) {
     $xrayOk = nrv_xray_pid($cfg) !== null;
     $daemonOk = nrv_daemon_pid($cfg) !== null;
     $warnings = [];
-    // Diagnostic only, never treated as "running" — but if our own process
-    // check says stopped while something else answers on the port, that's
-    // worth surfacing: either a leftover orphan from before a fix, or
-    // (as seen on one real host) an unrelated service/proxy on this port.
     if (!$xrayOk && nrv_port_open((int)$cfg['xray']['local_port'])) {
         $warnings[] = 'Xray looks stopped, but something is already answering on local port ' . $cfg['xray']['local_port'] . ' — likely a leftover process from an earlier attempt, or a port conflict with another service on this host.';
     }
@@ -1137,13 +1173,6 @@ function nrv_run_login_healthcheck($cfg) {
     ];
 }
 
-// Tests the HOST'S OWN outbound network directly with plain curl — no Xray,
-// no VLESS, no relay involved at all. This is the one tool that can tell
-// "our relay is broken" apart from "this specific host's own outbound
-// network to this destination is slow/blocked/throttled", which otherwise
-// looks identical from inside the tunnel (both show up as "connects, but no
-// data" or "very slow"). Especially valuable on hosts with no SSH access,
-// where there's no other way to run a quick connectivity check.
 function nrv_run_network_diagnostics() {
     $targets = [
         'Google' => 'https://www.google.com',
@@ -1156,7 +1185,7 @@ function nrv_run_network_diagnostics() {
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_NOBODY => true, // HEAD-equivalent, we only care about connect+TTFB
+            CURLOPT_NOBODY => true,
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_TIMEOUT => 12,
             CURLOPT_SSL_VERIFYPEER => true,
@@ -1187,17 +1216,12 @@ if (!defined('NRV_INCLUDED_AS_LIB')) {
 $cfg = nrv_load_config();
 $installed = $cfg !== null && !empty($cfg['installed']);
 
-// ---------- Logout ----------
-// POST + CSRF, not GET — a state-changing action (ending the admin's
-// session) shouldn't be triggerable by a third-party page linking/embedding
-// a GET request. Doesn't touch anything relay/connection-related.
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['nrv_action'] ?? '') === 'logout' && nrv_csrf_valid()) {
     session_destroy();
     header('Location: ' . basename(__FILE__));
     exit;
 }
 
-// ---------- Not installed: run wizard ----------
 if (!$installed) {
     $step = $_POST['step'] ?? $_GET['step'] ?? '1';
     $envTests = null;
@@ -1206,10 +1230,6 @@ if (!$installed) {
 
     if ($step === '1') {
         $envTests = nrv_run_env_tests();
-        // Only directory-writability is truly install-blocking. exec()/proc_open()
-        // being unavailable just means Start/Stop controls will be disabled later
-        // (see Settings page) — the panel, config, and client-config generation
-        // all work without them, which matters on the most locked-down hosts.
         $writeTest = current(array_filter($envTests, fn($t) => $t['name'] === 'Write permission in panel directory'));
         $envPassed = $writeTest && $writeTest['ok'];
     }
@@ -1224,13 +1244,6 @@ if (!$installed) {
         $adminUser = trim($_POST['admin_username'] ?: 'admin');
         $adminPass = $_POST['admin_password'] ?? '';
 
-        // Defense-in-depth input validation — every value below already flows
-        // through escapeshellarg() wherever it reaches exec()/proc_open(), so
-        // this isn't closing a shell-injection hole; it rejects path
-        // traversal in base_dir (which is used directly in filesystem
-        // operations, not just shelled-out commands) and strips characters
-        // that have no legitimate reason to appear in a hostname/URL path,
-        // as a second layer beyond the existing escaping.
         if (strpos($baseDir, "\0") !== false || preg_match('#(^|[\\\\/])\.\.([\\\\/]|$)#', $baseDir)) {
             $installError = 'Base directory must not contain ".." path segments.';
         } elseif (preg_match('/[\x00-\x1F\x7F]/', $splitPath) || preg_match('/[\x00-\x1F\x7F]/', $publicHost)) {
@@ -1284,10 +1297,6 @@ if (!$installed) {
 
             if ($xrayReady) {
                 nrv_build_xray_config($newCfg);
-                // Config must be written to disk BEFORE starting the daemon —
-                // daemon.php is a separate process that reads NoRoot-Config.json
-                // from disk on its own; starting it while the config only exists
-                // in this request's memory means it always fails to read it.
                 $newCfg['installed'] = true;
                 nrv_save_config($newCfg);
                 $started = nrv_xray_start($newCfg);
@@ -1393,7 +1402,6 @@ if (!$installed) {
     exit;
 }
 
-// ---------- Installed but not logged in ----------
 if (empty($_SESSION['nrv_logged_in'])) {
     $loginError = null;
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -1419,11 +1427,6 @@ if (empty($_SESSION['nrv_logged_in'])) {
             $loginError = 'Invalid username or password.';
         }
     }
-    // A fresh challenge every render (including after a failed attempt) so a
-    // captured/replayed answer can't be reused — a self-hosted image CAPTCHA
-    // (no external service dependency, works even on heavily-censored
-    // networks where a third-party CAPTCHA might not load), falling back to
-    // a simple arithmetic question only if this host's PHP has no GD.
     $useImageCaptcha = nrv_captcha_available();
     if ($useImageCaptcha) {
         $captchaCode = nrv_captcha_generate_code();
@@ -1475,14 +1478,8 @@ if (empty($_SESSION['nrv_logged_in'])) {
     exit;
 }
 
-// Every authenticated page load gets a cheap, rate-limited liveness check —
-// this is what makes a dead Xray/daemon process self-heal without an admin
-// noticing and manually clicking Restart.
 nrv_ensure_services_running($cfg);
 
-// ============================================================
-// AUTHENTICATED ACTIONS (POST)
-// ============================================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['nrv_action'])) {
     $action = $_POST['nrv_action'];
 
@@ -1622,13 +1619,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['nrv_action'])) {
     }
 }
 
-// ============================================================
-// DASHBOARD LAYOUT
-// ============================================================
 $page = $_GET['page'] ?? 'dashboard';
 $xrayPid = nrv_xray_pid($cfg);
 $daemonPid = nrv_daemon_pid($cfg);
 $nrvNewVersion = nrv_update_available();
+
+$nrvPhpBin = nrv_find_php_binary();
+$nrvPhpFlags = implode(' ', nrv_php_cli_flags());
+$nrvPhpCmd = trim($nrvPhpBin . ' ' . $nrvPhpFlags);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1890,7 +1888,7 @@ $nrvNewVersion = nrv_update_available();
         <?php if (!$procCtlAvailable): ?>
           <div class="alert bad" style="margin-bottom:12px;">
             Neither exec() nor proc_open() is available on this host — the buttons below are disabled.
-            Start the daemon manually: <code><?= htmlspecialchars(nrv_find_php_binary()) ?> <?= htmlspecialchars(NRV_DIR . '/daemon.php') ?></code>
+            Start the daemon manually: <code><?= htmlspecialchars($nrvPhpCmd . ' ' . NRV_DIR . '/daemon.php') ?></code>
           </div>
         <?php endif; ?>
         <form method="post" style="display:inline">
@@ -1917,7 +1915,7 @@ $nrvNewVersion = nrv_update_available();
           minute) even on hosts where the buttons above can't. Add this exact line in your host's Cron
           Jobs page (cPanel: Advanced &rarr; Cron Jobs), set to run every minute:
         </p>
-        <pre class="log-box"><?= htmlspecialchars('* * * * * ' . nrv_find_php_binary() . ' ' . NRV_DIR . '/cron.php ' . nrv_ensure_cron_token($cfg) . (NRV_IS_WINDOWS ? ' >NUL 2>&1' : ' >/dev/null 2>&1')) ?></pre>
+        <pre class="log-box"><?= htmlspecialchars('* * * * * ' . $nrvPhpCmd . ' ' . NRV_DIR . '/cron.php ' . nrv_ensure_cron_token($cfg) . (NRV_IS_WINDOWS ? ' >NUL 2>&1' : ' >/dev/null 2>&1')) ?></pre>
         <?php if (!NRV_IS_WINDOWS): ?>
           <p class="muted" style="margin-top:14px;margin-bottom:10px;">
             If Start ever fails with "Address already in use" and you have no SSH access to kill the
