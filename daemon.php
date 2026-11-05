@@ -53,7 +53,7 @@ function nrvd_log($msg) {
 $localPort = (int)$cfg['xray']['local_port'];
 $daemonPort = (int)($cfg['xray']['daemon_port'] ?? 10001);
 
-define('NRVD_MAX_SESSIONS', 500);
+define('NRVD_MAX_SESSIONS', 200);
 define('NRVD_CONNECT_RETRY_BACKOFF', [1, 2, 4, 8, 15]);
 define('NRVD_CONNECT_MAX_ATTEMPTS', 5);
 // On a CPU-throttled shared host, Xray can genuinely take longer to produce
@@ -63,7 +63,7 @@ define('NRVD_CONNECT_MAX_ATTEMPTS', 5);
 // actually failed. 25s is generous enough to absorb real CPU throttling
 // while still being well under the idle-GC windows below.
 define('NRVD_HEADER_STALL_TIMEOUT_SEC', 25);
-define('NRVD_IDLE_GC_SEC', 90);
+define('NRVD_IDLE_GC_SEC', 30);
 define('NRVD_FAILED_IDLE_GC_SEC', 15);
 // Every proxy.php GET request holding this long-poll open ties up one full
 // PHP worker process (lsphp/PHP-FPM) on the web server for the ENTIRE wait.
@@ -78,7 +78,7 @@ define('NRVD_FAILED_IDLE_GC_SEC', 15);
 // the cost of the client reconnecting its GET more often (cheap: it's a
 // bounded wait, not a busy loop, and each reconnect returns instantly once
 // real data exists).
-define('NRVD_PENDING_GET_MAX_WAIT_SEC', 4);
+define('NRVD_PENDING_GET_MAX_WAIT_SEC', 2);
 // Hard cap on how much unread data a single session may buffer in memory.
 // Without this, a session whose client-side GET can't keep up (e.g. a large
 // download stuck behind worker exhaustion) would let nrvd_process_bytes grow
@@ -88,7 +88,7 @@ define('NRVD_PENDING_GET_MAX_WAIT_SEC', 4);
 // until the buffer drains — real TCP backpressure: Xray's own write to that
 // socket eventually blocks, which naturally throttles the upstream source
 // too, instead of us just accumulating unbounded memory.
-define('NRVD_MAX_SESSION_BUFFER_BYTES', 1 * 1024 * 1024);
+define('NRVD_MAX_SESSION_BUFFER_BYTES', 2 * 1024 * 1024);
 // NOTE: a periodic in-loop Xray liveness/restart check was tried here and
 // removed — it called nrv_xray_pid()/nrv_xray_start() (which can block on
 // exec() and a hardcoded 600ms usleep) directly inside this single-threaded
