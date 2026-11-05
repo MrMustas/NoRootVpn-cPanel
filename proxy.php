@@ -82,6 +82,17 @@ if ($forwardPath === '' || $forwardPath[0] !== '/') {
 }
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $sessionId = $_GET['x_session'] ?? null;
+// The panel's server-side xhttp inbound uses sessionPlacement=path (see
+// nrv_build_xray_config), which means the client puts the session UUID as
+// the first path segment after proxy.php — /proxy.php/<uuid>?x_seq=0 —
+// NOT in the query string. Read it from there too, so the daemon relay
+// actually engages regardless of which placement the client's xhttp
+// implementation chose.
+if ($sessionId === null || $sessionId === '') {
+    if (preg_match('#/proxy\.php/([^/?]+)#', $forwardPath, $m)) {
+        $sessionId = $m[1];
+    }
+}
 
 define('NRVP_DEBUG_LOG', __DIR__ . '/bin/proxy-debug.log');
 $nrvpDebugStart = microtime(true);
@@ -188,9 +199,9 @@ if ($method === 'GET' && !$nrvpDaemonOk) {
     // So: release fast when idle (protects the shared worker budget), but
     // let genuinely active transfers keep going much longer (protects
     // download throughput/stability) — governed by two separate clocks.
-    $idleTimeoutSec = 1.5;   // no NEW data this long -> release the worker
-    $absoluteMaxSec = 25;    // hard backstop regardless of activity
-    $daemonCallTimeoutSec = 2; // safely above daemon.php's own 1s long-poll max wait
+    $idleTimeoutSec = 2.5;      // no NEW data this long -> release the worker
+    $absoluteMaxSec = 25;     // hard backstop regardless of activity
+    $daemonCallTimeoutSec = 3; // must be > daemon's NRVD_PENDING_GET_MAX_WAIT_SEC (4s)
     $deadline = microtime(true) + $absoluteMaxSec;
     $lastActivity = microtime(true);
     $headerSent = false;
