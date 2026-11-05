@@ -807,7 +807,7 @@ function nrv_client_links($cfg, $user) {
     $queryParams = [
         'type' => 'xhttp',
         'path' => $path,
-        'mode' => 'packet-up',
+        'mode' => 'auto',
         'host' => $host,
         'security' => $useTls ? 'tls' : 'none',
     ];
@@ -827,7 +827,7 @@ function nrv_client_links($cfg, $user) {
         'security' => $useTls ? 'tls' : 'none',
         'xhttpSettings' => [
             'path' => $path,
-            'mode' => 'packet-up',
+            'mode' => 'auto',
             'extra' => [
                 'sessionPlacement' => 'path',
                 'seqPlacement' => 'query',
